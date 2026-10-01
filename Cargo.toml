@@ -1,0 +1,11 @@
+[package]
+name = "quiet-lane"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Testnet-10 sealed throw whose exit leaf still pays when the lane is quiet."
+
+[[example]]
+name = "throw"
+
+[dependencies]
