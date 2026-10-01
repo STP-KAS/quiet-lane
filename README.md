@@ -2,13 +2,13 @@
 
 Experimental only. Not a product.
 
-A lab vprog for Kaspa testnet-10. Two seats seal a face. The prize is one exit leaf. A settlement that matches nothing still publishes that leaf, and the claim spends the smallest large-first slice of the delegate pool.
+A lab model for Kaspa testnet-10. Two seats seal a face. The prize is one exit leaf. A settlement that matches nothing still publishes that leaf, and the claim spends the smallest large-first slice of the delegate pool.
 
-This crate does not submit a transaction, load a wallet, or prove a receipt. The seal is a lab mix, not a Kaspa hash. [DISCLAIMER.md](DISCLAIMER.md).
+This crate is not a vprog. It does not load an ELF, call `runtime::run`, or enter the node VM. On kaspanet/vprogs master `f9b84a8`, `node/vm` `process_transaction` is `todo!`. The guest body that does run is `zk/backend/risc0/runtime-processor`, and the host check of that body is [STP-KAS/vprog-runtime-test](https://github.com/STP-KAS/vprog-runtime-test). This crate does not submit a transaction, load a wallet, or prove a receipt. The seal is a lab mix, not a Kaspa hash. [DISCLAIMER.md](DISCLAIMER.md).
 
 ## What
 
-`Table` is the guest. Each seat commits a digest, then reveals a face and a salt. Stone breaks Blade, Blade cuts Cloth, and Cloth covers Stone. The same face returns both stakes. A seat that never reveals, after the window, forfeits the pot to the seat that did. `note_l1` records a carrier. `execute` is the guest. The seats stay empty until `execute`.
+`Table` is the modeled board. Each seat commits a digest, then reveals a face and a salt. Stone breaks Blade, Blade cuts Cloth, and Cloth covers Stone. The same face returns both stakes. A seat that never reveals, after the window, forfeits the pot to the seat that did. `note_l1` records a carrier. `execute` applies the reveal. The seats stay empty until `execute`.
 
 `Lane::wake` is the settler path. `Policy::Master` is kaspanet/vprogs `f9b84a8`: the retained window only, so an unmatched boundary leaves the leaf in the suffix. `Policy::EarlyReturn` is the parent `fbd677c2`: both windows count, and a queued hit is enough to re-form. `Policy::FallThrough` is `edb9633a`: an unmatched boundary re-forms anyway. A second wake of the same front is guarded. A deferred proof on that fall-through still sets the guard. Master has no deferred-proof return. `latest: None` moves nothing. `rollback` clears the guard.
 
@@ -84,6 +84,7 @@ The hosted demo at `https://vprogs-tt.izio.fr/api/state` answered on both fetche
 
 | Where | What the files say |
 | --- | --- |
+| This crate | It is a model of the settler wake and the claim loop. It is not a guest program. Master `node/vm` does not execute transactions. |
 | Which vprogs commit | kaspanet/vprogs master is `f9b84a8`. Tic-tac-toe master `cb91e862` pins branch `fix/exits-stranded-suffix` at `edb9633a`. |
 | Master versus the parent | `f9b84a8` matches retained blocks only. A boundary that hits the queued window and misses retained returns, and the queued batch stays. `EarlyReturn` is `fbd677c2`, which drains that queued batch and re-forms the suffix. |
 | Absent settlement | `latest: None` returns before the drain on master and on `edb9633a`. The guard stays. Rollback is what clears it. |
