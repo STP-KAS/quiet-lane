@@ -4,15 +4,20 @@
 //! breaks Blade, Blade cuts Cloth, Cloth covers Stone. The prize is an exit
 //! leaf sitting in the retained suffix.
 //!
-//! [`Lane::wake`] is the settler path in `reaggregate_superseded` at
-//! kaspanet/vprogs `edb9633a` (`zk/aggregate-prover/src/worker.rs`).
-//! [`Policy::EarlyReturn`] leaves that leaf unpublished when the settlement
-//! matches no window block. [`Policy::FallThrough`] re-forms the suffix anyway.
-//! The front-index guard makes a second wake of the same front a no-op.
+//! [`Lane::wake`] follows `reaggregate_superseded` in
+//! `zk/aggregate-prover/src/worker.rs`.
+//! [`Policy::Master`] is kaspanet/vprogs `f9b84a8`: the retained window only,
+//! and an unmatched boundary returns before the re-form.
+//! [`Policy::EarlyReturn`] is the parent `fbd677c2`: both windows, and an
+//! unmatched pair returns.
+//! [`Policy::FallThrough`] is `edb9633a`: both windows, and an unmatched pair
+//! re-forms. The front-index guard makes a second wake of the same front a no-op.
 //!
 //! [`select_delegates`] is the claim loop in biryukovmaxim/vprog-tictactoe
 //! `driver/examples/claim.rs` at `5c37c146`: largest first, stop once the coins
-//! already taken cover the leaf.
+//! already taken cover the leaf. A published leaf is claimable immediately.
+//! The 25-step gap in the declared-ply note is a sequence gap between plies,
+//! not a wait on this claim.
 //!
 //! [`Table::note_l1`] records a carrier. [`Table::execute`] is the guest.
 //! A carrier can be on L1 while the seats are still empty, which is the split
@@ -22,9 +27,6 @@
 //! not a Kaspa hash.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-/// Steps a fresh leaf waits before a claim. The campaign's orphan gap.
-pub const ORPHAN_GAP: u64 = 25;
 
 /// Sompi in one tKAS.
 pub const SOMPI_PER_TKAS: u64 = 100_000_000;
@@ -90,9 +92,11 @@ pub enum Finish {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
-    /// Unmatched settlement returns before the re-form.
+    /// kaspanet/vprogs master `f9b84a8`. Retained window only.
+    Master,
+    /// Parent `fbd677c2`. Both windows. An unmatched pair returns.
     EarlyReturn,
-    /// Unmatched settlement falls through into the re-form.
+    /// `edb9633a`. Both windows. An unmatched pair re-forms.
     FallThrough,
 }
 
@@ -114,6 +118,8 @@ pub struct Boundary {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reform {
+    /// `latest` was `None`. The lane was not changed.
+    Absent,
     /// The unmatched boundary returned before any re-form.
     EarlyReturn,
     /// The retained suffix was empty, and the guard was cleared.
@@ -169,7 +175,6 @@ pub struct OpenSpec {
 pub struct Claim {
     pub seat: Seat,
     pub leaf: u64,
-    pub daa: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +235,8 @@ pub enum CloseError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeError {
     BadPrefix,
+    /// Master has no deferred-proof return. The lane was not changed.
+    NoDeferral,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -237,8 +244,6 @@ pub enum ClaimError {
     Stranded,
     WrongSeat,
     AlreadyClaimed,
-    Immature,
-    DaaOverflow,
     ZeroLeaf,
     ShortPool,
     Overflow,
@@ -299,8 +304,8 @@ pub fn lab_seal(seat: Seat, face: Face, salt: &[u8; 16]) -> [u8; 32] {
 /// Largest-first subset that covers `leaf`.
 ///
 /// A coin is taken while the sum already taken is still short. The coin that
-/// crosses `leaf` is included. A `leaf` of 0 selects nothing. Addition
-/// saturates, matching the driver loop.
+/// crosses `leaf` is included. A `leaf` of 0 selects nothing. Equal amounts
+/// keep their input order. Addition saturates, matching the driver loop.
 pub fn select_delegates(coins: &[Coin], leaf: u64) -> Vec<Coin> {
     let mut ranked = coins.to_vec();
     ranked.sort_by_key(|coin| std::cmp::Reverse(coin.sompi));
@@ -367,19 +372,39 @@ impl Lane {
         self.retained.len()
     }
 
+    /// `latest: None` on master `f9b84a8` and on `edb9633a`.
+    ///
+    /// The lane does not drain, re-form, or clear the guard. Rollback is the
+    /// path that truncates.
+    pub fn settlement_absent(&self) -> WakeReport {
+        WakeReport {
+            dropped_queued: 0,
+            dropped_retained: 0,
+            reform: Reform::Absent,
+        }
+    }
+
     /// Applies one settlement wake.
     ///
-    /// A prefix longer than its window is [`WakeError::BadPrefix`] and changes
-    /// nothing. An unmatched boundary under [`Policy::EarlyReturn`] returns
-    /// before the drain. Every other wake drains the matched prefixes, then
-    /// re-forms up to `bundle_cap` retained batches from the front. Those
-    /// batches stay retained.
+    /// [`Policy::Master`] ignores the queued prefix, including a count past
+    /// the queue. An unmatched retained boundary returns with the lane
+    /// unchanged. A deferred proof is [`WakeError::NoDeferral`] and changes
+    /// nothing.
+    ///
+    /// On the other two policies a prefix longer than its window is
+    /// [`WakeError::BadPrefix`] and changes nothing. An unmatched boundary
+    /// under [`Policy::EarlyReturn`] returns before the drain. Every other
+    /// wake drains the matched prefixes, then re-forms up to `bundle_cap`
+    /// retained batches from the front. Those batches stay retained.
     pub fn wake(
         &mut self,
         policy: Policy,
         boundary: Boundary,
         prove: Prove,
     ) -> Result<WakeReport, WakeError> {
+        if policy == Policy::Master {
+            return self.wake_master(boundary, prove);
+        }
         let queued_n = prefix(boundary.queued_prefix, self.queued.len())?;
         let retained_n = prefix(boundary.retained_prefix, self.retained.len())?;
         if queued_n.is_none() && retained_n.is_none() && policy == Policy::EarlyReturn {
@@ -408,6 +433,34 @@ impl Lane {
         self.queued.retain(|batch| batch.index <= target_index);
         self.retained.retain(|batch| batch.index <= target_index);
         self.last_reformed_from = None;
+    }
+
+    /// Master `f9b84a8`: retained match, then the same re-form.
+    ///
+    /// The queued prefix is not read. A deferred proof returns
+    /// [`WakeError::NoDeferral`] before any drain.
+    fn wake_master(
+        &mut self,
+        boundary: Boundary,
+        prove: Prove,
+    ) -> Result<WakeReport, WakeError> {
+        if prove == Prove::Deferred {
+            return Err(WakeError::NoDeferral);
+        }
+        let Some(n) = prefix(boundary.retained_prefix, self.retained.len())? else {
+            return Ok(WakeReport {
+                dropped_queued: 0,
+                dropped_retained: 0,
+                reform: Reform::EarlyReturn,
+            });
+        };
+        self.retained.drain(0..n);
+        let reform = self.reform(prove);
+        Ok(WakeReport {
+            dropped_queued: 0,
+            dropped_retained: n,
+            reform,
+        })
     }
 
     /// Re-forms the retained front. See [`Reform`] for each result.
@@ -655,7 +708,8 @@ impl Table {
     ///
     /// The selected coins leave the pool. Excess comes back as one change coin.
     /// Coins that were not selected stay, with the same ids. The pool sum plus
-    /// the paid leaf equals the pool sum from before the claim.
+    /// the paid leaf equals the pool sum from before the claim. Publication is
+    /// the gate. There is no DAA wait.
     pub fn claim(&mut self, claim: Claim) -> Result<Payout, ClaimError> {
         if self.claimed.contains(&claim.leaf) {
             return Err(ClaimError::AlreadyClaimed);
@@ -672,13 +726,6 @@ impl Table {
         }
         if leaf.sompi == 0 {
             return Err(ClaimError::ZeroLeaf);
-        }
-        let mature = leaf
-            .born_daa
-            .checked_add(ORPHAN_GAP)
-            .ok_or(ClaimError::DaaOverflow)?;
-        if claim.daa < mature {
-            return Err(ClaimError::Immature);
         }
         let selected = select_delegates(&self.pool, leaf.sompi);
         let mut sum = 0u64;
@@ -877,12 +924,59 @@ pub fn script(daa: u64) -> Result<ScriptReport, ScriptError> {
     let stranded = early.claim(Claim {
         seat: Seat::Creator,
         leaf: 1,
-        daa: daa
-            .checked_add(ORPHAN_GAP)
-            .ok_or(ScriptError::Shape("daa overflow"))?,
     });
     if stranded != Err(ClaimError::Stranded) {
         return Err(ScriptError::Shape("early claim should be stranded"));
+    }
+    let mut master_table = table.clone();
+    let master_quiet = master_table.wake(Policy::Master, quiet, Prove::Emitted)?;
+    if master_quiet.reform != Reform::EarlyReturn || !master_table.published().is_empty() {
+        return Err(ScriptError::Shape("master should strand an unmatched leaf"));
+    }
+    let absent = master_table.lane().settlement_absent();
+    if absent.reform != Reform::Absent || master_table.lane().retained_len() != 1 {
+        return Err(ScriptError::Shape("an absent settlement should move nothing"));
+    }
+
+    let mut queued_lane = Lane::new(4)?;
+    queued_lane.push_queued(Batch {
+        index: 1,
+        has_txs: true,
+        leaves: vec![],
+    });
+    queued_lane.push_retained(Batch {
+        index: 2,
+        has_txs: true,
+        leaves: vec![Leaf {
+            id: 1,
+            seat: Seat::Creator,
+            sompi: stake * 2,
+            born_daa: daa,
+        }],
+    });
+    let queued_only = Boundary {
+        queued_prefix: Some(1),
+        retained_prefix: None,
+    };
+    let master_queued = queued_lane
+        .wake(Policy::Master, queued_only, Prove::Emitted)?;
+    if master_queued.reform != Reform::EarlyReturn
+        || queued_lane.queued_len() != 1
+        || !queued_lane.published().is_empty()
+    {
+        return Err(ScriptError::Shape(
+            "master should ignore a queued-only match",
+        ));
+    }
+    let mut parent = queued_lane.clone();
+    let parent_wake = parent.wake(Policy::EarlyReturn, queued_only, Prove::Emitted)?;
+    if parent_wake.dropped_queued != 1
+        || parent_wake.reform != Reform::Published(1)
+        || parent.queued_len() != 0
+    {
+        return Err(ScriptError::Shape(
+            "parent should publish on a queued-only match",
+        ));
     }
 
     let published = table.wake(Policy::FallThrough, quiet, Prove::Emitted)?;
@@ -894,28 +988,13 @@ pub fn script(daa: u64) -> Result<ScriptReport, ScriptError> {
         return Err(ScriptError::Shape("republish should be guarded"));
     }
 
-    let immature_at = daa
-        .checked_add(ORPHAN_GAP - 1)
-        .ok_or(ScriptError::Shape("daa overflow"))?;
-    let mature_at = daa
-        .checked_add(ORPHAN_GAP)
-        .ok_or(ScriptError::Shape("daa overflow"))?;
     table.deposit_delegate(40_000_000);
     table.deposit_delegate(150_000_000);
     table.deposit_delegate(70_000_000);
     let pool_before = table.pool_total();
-    let immature = table.claim(Claim {
-        seat: Seat::Creator,
-        leaf: 1,
-        daa: immature_at,
-    });
-    if immature != Err(ClaimError::Immature) {
-        return Err(ScriptError::Shape("claim inside the gap should wait"));
-    }
     let payout = table.claim(Claim {
         seat: Seat::Creator,
         leaf: 1,
-        daa: mature_at,
     })?;
     let pool_after = table.pool_total();
     if payout.paid != stake * 2 || pool_before != pool_after + payout.paid {
@@ -960,6 +1039,10 @@ pub fn script(daa: u64) -> Result<ScriptReport, ScriptError> {
         "The leaf sits in the retained suffix. The settlement matches nothing.".to_string(),
         "Early return leaves the leaf in the suffix. The claim is stranded.".to_string(),
         "Fall through publishes the leaf. A second wake of the same front is guarded.".to_string(),
+        "Master f9b84a8 strands that unmatched leaf. The queue is not its window.".to_string(),
+        "A queued-only match still strands the leaf on master. The parent fbd677c2 publishes it."
+            .to_string(),
+        "An absent settlement moves nothing.".to_string(),
         format!(
             "Claim spends delegate coins 2 and 3. Change {} sompi returns. Coin 1 stays.",
             20_000_000
@@ -1366,6 +1449,9 @@ mod tests {
         assert!(text.contains("Stone breaks Blade."));
         assert!(text.contains("The claim is stranded."));
         assert!(text.contains("same front is guarded"));
+        assert!(text.contains("Master f9b84a8 strands that unmatched leaf."));
+        assert!(text.contains("parent fbd677c2 publishes it."));
+        assert!(text.contains("An absent settlement moves nothing."));
     }
 
     #[test]
@@ -1467,29 +1553,17 @@ mod tests {
         assert_eq!(
             table
                 .claim(Claim {
-                    seat: Seat::Creator,
-                    leaf: 1,
-                    daa: ORPHAN_GAP - 1
-                })
-                .unwrap_err(),
-            ClaimError::Immature
-        );
-        assert_eq!(table.pool(), before.as_slice());
-        assert_eq!(
-            table
-                .claim(Claim {
                     seat: Seat::Joiner,
                     leaf: 1,
-                    daa: ORPHAN_GAP
                 })
                 .unwrap_err(),
             ClaimError::WrongSeat
         );
+        assert_eq!(table.pool(), before.as_slice());
         let paid = table
             .claim(Claim {
                 seat: Seat::Creator,
                 leaf: 1,
-                daa: ORPHAN_GAP,
             })
             .unwrap();
         assert_eq!(paid.spent, vec![2, 1]);
@@ -1500,7 +1574,6 @@ mod tests {
                 .claim(Claim {
                     seat: Seat::Creator,
                     leaf: 1,
-                    daa: ORPHAN_GAP
                 })
                 .unwrap_err(),
             ClaimError::AlreadyClaimed
@@ -1510,7 +1583,6 @@ mod tests {
                 .claim(Claim {
                     seat: Seat::Joiner,
                     leaf: 2,
-                    daa: ORPHAN_GAP
                 })
                 .unwrap_err(),
             ClaimError::ZeroLeaf
@@ -1527,7 +1599,6 @@ mod tests {
                 .claim(Claim {
                     seat: Seat::Creator,
                     leaf: 1,
-                    daa: ORPHAN_GAP
                 })
                 .unwrap_err(),
             ClaimError::ShortPool
@@ -1543,7 +1614,6 @@ mod tests {
                 .claim(Claim {
                     seat: Seat::Creator,
                     leaf: 1,
-                    daa: ORPHAN_GAP
                 })
                 .unwrap_err(),
             ClaimError::Overflow
@@ -1687,7 +1757,6 @@ mod tests {
             match table.claim(Claim {
                 seat: Seat::Creator,
                 leaf: 1,
-                daa: ORPHAN_GAP,
             }) {
                 Ok(payout) => {
                     assert_eq!(payout.paid, leaf_sompi);
@@ -1949,7 +2018,6 @@ mod tests {
             .claim(Claim {
                 seat: Seat::Creator,
                 leaf: 1,
-                daa: ORPHAN_GAP,
             })
             .unwrap();
         assert_eq!(payout.paid, 8);
@@ -1958,7 +2026,6 @@ mod tests {
                 .claim(Claim {
                     seat: Seat::Creator,
                     leaf: 1,
-                    daa: ORPHAN_GAP
                 })
                 .unwrap_err(),
             ClaimError::AlreadyClaimed
@@ -2009,6 +2076,139 @@ mod tests {
     }
 
     #[test]
+    fn master_ignores_the_queued_window_and_a_deferred_proof() {
+        let mut lane = Lane::new(4).unwrap();
+        lane.push_queued(Batch {
+            index: 1,
+            has_txs: true,
+            leaves: vec![],
+        });
+        lane.push_retained(Batch {
+            index: 4,
+            has_txs: true,
+            leaves: vec![Leaf {
+                id: 1,
+                seat: Seat::Creator,
+                sompi: 9,
+                born_daa: 0,
+            }],
+        });
+        lane.push_retained(Batch {
+            index: 5,
+            has_txs: false,
+            leaves: vec![],
+        });
+        let queued_only = Boundary {
+            queued_prefix: Some(99),
+            retained_prefix: None,
+        };
+        let missed = lane
+            .wake(Policy::Master, queued_only, Prove::Emitted)
+            .unwrap();
+        assert_eq!(missed.reform, Reform::EarlyReturn);
+        assert_eq!(lane.queued_len(), 1);
+        assert_eq!(lane.retained_len(), 2);
+        assert!(lane.published().is_empty());
+        assert_eq!(lane.last_reformed_from(), None);
+
+        let mut parent = lane.clone();
+        let published = parent
+            .wake(
+                Policy::EarlyReturn,
+                Boundary {
+                    queued_prefix: Some(1),
+                    retained_prefix: None,
+                },
+                Prove::Emitted,
+            )
+            .unwrap();
+        assert_eq!(published.dropped_queued, 1);
+        assert_eq!(published.reform, Reform::Published(1));
+        assert_eq!(parent.queued_len(), 0);
+        assert_eq!(parent.published().len(), 1);
+
+        let before = lane.clone();
+        assert_eq!(
+            lane.wake(
+                Policy::Master,
+                Boundary {
+                    queued_prefix: Some(1),
+                    retained_prefix: Some(1),
+                },
+                Prove::Deferred,
+            )
+            .unwrap_err(),
+            WakeError::NoDeferral
+        );
+        assert_eq!(lane, before);
+
+        let formed = lane
+            .wake(
+                Policy::Master,
+                Boundary {
+                    queued_prefix: Some(99),
+                    retained_prefix: Some(1),
+                },
+                Prove::Emitted,
+            )
+            .unwrap();
+        assert_eq!(formed.dropped_queued, 0);
+        assert_eq!(formed.dropped_retained, 1);
+        assert_eq!(formed.reform, Reform::Noop);
+        assert_eq!(lane.queued_len(), 1);
+        assert_eq!(lane.retained_len(), 1);
+        assert_eq!(lane.last_reformed_from(), Some(5));
+        assert!(lane.published().is_empty());
+
+        let again = lane
+            .wake(Policy::Master, queued_only, Prove::Emitted)
+            .unwrap();
+        assert_eq!(again.reform, Reform::EarlyReturn);
+        assert_eq!(lane.last_reformed_from(), Some(5));
+        assert_eq!(lane.queued_len(), 1);
+
+        let absent = lane.settlement_absent();
+        assert_eq!(absent.reform, Reform::Absent);
+        assert_eq!(lane.last_reformed_from(), Some(5));
+        assert_eq!(lane.retained_len(), 1);
+
+        let cleared = lane
+            .wake(
+                Policy::Master,
+                Boundary {
+                    queued_prefix: None,
+                    retained_prefix: Some(1),
+                },
+                Prove::Emitted,
+            )
+            .unwrap();
+        assert_eq!(cleared.dropped_queued, 0);
+        assert_eq!(cleared.reform, Reform::EmptySuffix);
+        assert_eq!(lane.last_reformed_from(), None);
+        assert_eq!(lane.queued_len(), 1);
+        assert_eq!(lane.retained_len(), 0);
+    }
+
+    #[test]
+    fn master_rejects_a_retained_prefix_past_the_window() {
+        let mut lane = sample_lane(4);
+        let before = lane.clone();
+        assert_eq!(
+            lane.wake(
+                Policy::Master,
+                Boundary {
+                    queued_prefix: Some(3),
+                    retained_prefix: Some(2),
+                },
+                Prove::Emitted,
+            )
+            .unwrap_err(),
+            WakeError::BadPrefix
+        );
+        assert_eq!(lane, before);
+    }
+
+    #[test]
     fn some_zero_is_an_unmatched_boundary() {
         let mut lane = sample_lane(4);
         let report = lane
@@ -2022,6 +2222,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(report.reform, Reform::EarlyReturn);
+        assert!(lane.published().is_empty());
+        let master = lane
+            .wake(
+                Policy::Master,
+                Boundary {
+                    queued_prefix: Some(0),
+                    retained_prefix: Some(0),
+                },
+                Prove::Emitted,
+            )
+            .unwrap();
+        assert_eq!(master.reform, Reform::EarlyReturn);
+        assert_eq!(lane.retained_len(), 1);
+        assert!(lane.published().is_empty());
     }
 
     fn sample_lane(cap: usize) -> Lane {
