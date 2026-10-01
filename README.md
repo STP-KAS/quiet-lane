@@ -6,6 +6,20 @@ A lab model for Kaspa testnet-10. Two seats seal a face. The prize is one exit l
 
 This crate is not a vprog. It does not load an ELF, call `runtime::run`, or enter the node VM. On kaspanet/vprogs master `f9b84a8`, `node/vm` `process_transaction` is `todo!`. The guest body that does run is `zk/backend/risc0/runtime-processor`, and the host check of that body is [STP-KAS/vprog-runtime-test](https://github.com/STP-KAS/vprog-runtime-test). This crate does not submit a transaction, load a wallet, or prove a receipt. The seal is a lab mix, not a Kaspa hash. [DISCLAIMER.md](DISCLAIMER.md).
 
+## Test the guest
+
+The check to run is [STP-KAS/vprog-runtime-test](https://github.com/STP-KAS/vprog-runtime-test).
+
+```
+git clone https://github.com/STP-KAS/vprog-runtime-test.git
+cd vprog-runtime-test
+cargo test -p vprog-runtime-test --manifest-path vprogs/Cargo.toml
+```
+
+Three tests. Balances 50 and 7, amount 20, land at 30 and 27. Amount 51 is a guest error. Two indexes that are both 0 are a guest error. The first run needs a network so cargo can fetch the locked rusty-kaspa commit. The command submits nothing.
+
+`cargo test` in this repository is the settler model, 28 tests. It does not call that guest.
+
 ## What
 
 `Table` is the modeled board. Each seat commits a digest, then reveals a face and a salt. Stone breaks Blade, Blade cuts Cloth, and Cloth covers Stone. The same face returns both stakes. A seat that never reveals, after the window, forfeits the pot to the seat that did. `note_l1` records a carrier. `execute` applies the reveal. The seats stay empty until `execute`.
