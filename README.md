@@ -8,6 +8,8 @@ A hosted tic-tac-toe match on testnet-10, 1 Oct 2026, is written up in [TN10.md]
 
 This crate is not a vprog. It does not load an ELF, call `runtime::run`, or enter the node VM. On kaspanet/vprogs master `f9b84a8`, `node/vm` `process_transaction` is `todo!`. The guest body that does run is `zk/backend/risc0/runtime-processor`, and the host check of that body is [STP-KAS/vprog-runtime-test](https://github.com/STP-KAS/vprog-runtime-test). This crate does not submit a transaction, load a wallet, or prove a receipt. The seal is a lab mix, not a Kaspa hash. [DISCLAIMER.md](DISCLAIMER.md).
 
+The 9 Oct 2026 workshop lab is [STP-KAS/vprog-sovereign](https://github.com/STP-KAS/vprog-sovereign). The wake pins in this crate stay where they are. [WORKSHOP.md](WORKSHOP.md).
+
 ## Test the guest
 
 The check to run is [STP-KAS/vprog-runtime-test](https://github.com/STP-KAS/vprog-runtime-test).
